@@ -1,0 +1,44 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build outputs
+build/
+dist/
+*.spec.bak
+
+# Local data and user documents
+*.xlsx
+*.xls
+*.csv
+*.db
+*.sqlite
+*.sqlite3
+
+# Secrets and local environment
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+credentials*.json
+*token*
+*secret*
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# PyInstaller
+*.manifest
+*.log

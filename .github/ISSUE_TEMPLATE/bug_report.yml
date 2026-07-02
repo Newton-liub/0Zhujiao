@@ -1,0 +1,33 @@
+name: Bug report
+description: 报告工具运行异常或 Excel 解析问题
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提交前请先删除或脱敏 Excel 中的姓名、学号、班级、分数等真实数据。
+  - type: textarea
+    id: problem
+    attributes:
+      label: 问题描述
+      description: 说明实际行为和期望行为。
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 用最少步骤说明如何复现。
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: 版本
+      placeholder: 例如 v1.0.0
+  - type: textarea
+    id: sanitized-sample
+    attributes:
+      label: 脱敏样例说明
+      description: 如需提供样例，请只提供完全脱敏后的表头和虚构数据。

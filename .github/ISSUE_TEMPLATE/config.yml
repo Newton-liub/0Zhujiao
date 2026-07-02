@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 安全或数据泄露问题
+    url: https://github.com/Newton-liub
+    about: 请不要在公开 Issue 中粘贴真实学生数据或凭据。
