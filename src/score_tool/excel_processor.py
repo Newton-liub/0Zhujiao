@@ -12,7 +12,18 @@ from openpyxl.comments import Comment
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from .models import ProcessResult, ReviewFlag, SourceFileConfig, SourcePreview, StudentScoreRow
+from .models import (
+    REVIEW_RESULT_MODIFIED,
+    MergeData,
+    ProcessResult,
+    ReviewDecision,
+    ReviewExportResult,
+    ReviewFlag,
+    ReviewSessionItem,
+    SourceFileConfig,
+    SourcePreview,
+    StudentScoreRow,
+)
 
 REQUIRED_HEADERS = {
     "student_id": ("学号/工号", "学号", "工号"),
@@ -470,7 +481,21 @@ def format_review_summary(flags: list[ReviewFlag]) -> str:
     return "；".join(parts)
 
 
-def merge_sources(configs: list[SourceFileConfig], output_path: Path, include_log_sheet: bool = True) -> ProcessResult:
+def build_cell_reviews(review_flags: list[ReviewFlag]) -> dict[tuple[str, str], CellReview]:
+    cell_flags: dict[tuple[str, str], list[ReviewFlag]] = defaultdict(list)
+    for flag in review_flags:
+        cell_flags[(flag.student_id, flag.score_column)].append(flag)
+
+    return {
+        key: CellReview(
+            level="重点核查" if any(flag.level == "重点核查" for flag in grouped_flags) else "核查",
+            reasons=tuple(flag.reason for flag in grouped_flags),
+        )
+        for key, grouped_flags in cell_flags.items()
+    }
+
+
+def build_merge_data(configs: list[SourceFileConfig]) -> MergeData:
     if not configs:
         raise ValueError("请至少选择一个 Excel 文件")
 
@@ -530,29 +555,42 @@ def merge_sources(configs: list[SourceFileConfig], output_path: Path, include_lo
             natural_student_id_key(student["学号/工号"]),
         ),
     )
+    review_flags, _ = analyze_review_flags(ordered_students, score_columns)
+    return MergeData(
+        source_previews=previews,
+        students=ordered_students,
+        score_columns=score_columns,
+        warnings=warnings,
+        main_grade=main_grade,
+        review_flags=review_flags,
+    )
 
-    review_flags, cell_reviews = analyze_review_flags(ordered_students, score_columns)
-    focus_review_count = sum(1 for flag in review_flags if flag.level == "重点核查")
+
+def merge_sources(configs: list[SourceFileConfig], output_path: Path, include_log_sheet: bool = True) -> ProcessResult:
+    merge_data = build_merge_data(configs)
+    cell_reviews = build_cell_reviews(merge_data.review_flags)
+    focus_review_count = sum(1 for flag in merge_data.review_flags if flag.level == "重点核查")
 
     write_output(
         output_path,
-        ordered_students,
-        score_columns,
-        previews,
-        warnings,
+        merge_data.students,
+        merge_data.score_columns,
+        merge_data.source_previews,
+        merge_data.warnings,
         include_log_sheet,
-        main_grade,
-        review_flags,
+        merge_data.main_grade,
+        merge_data.review_flags,
         cell_reviews,
     )
     return ProcessResult(
         output_path=output_path,
-        source_previews=previews,
-        row_count=len(ordered_students),
-        score_columns=score_columns,
-        review_count=len(review_flags),
+        source_previews=merge_data.source_previews,
+        row_count=len(merge_data.students),
+        score_columns=merge_data.score_columns,
+        review_count=len(merge_data.review_flags),
         focus_review_count=focus_review_count,
-        warnings=warnings,
+        merge_data=merge_data,
+        warnings=merge_data.warnings,
     )
 
 
@@ -650,6 +688,144 @@ def write_output(
         style_worksheet(log_sheet)
 
     workbook.save(output_path)
+
+
+def make_review_item_key(student_id: str, score_column: str) -> str:
+    return f"{student_id}\u241f{score_column}"
+
+
+def build_review_session_items(merge_data: MergeData) -> list[ReviewSessionItem]:
+    flags_by_cell: dict[tuple[str, str], list[ReviewFlag]] = defaultdict(list)
+    for flag in merge_data.review_flags:
+        flags_by_cell[(flag.student_id, flag.score_column)].append(flag)
+
+    items: list[ReviewSessionItem] = []
+    for student in merge_data.students:
+        student_id = student["学号/工号"]
+        for score_column in merge_data.score_columns:
+            flags = flags_by_cell.get((student_id, score_column), [])
+            if not flags:
+                continue
+            items.append(
+                ReviewSessionItem(
+                    key=make_review_item_key(student_id, score_column),
+                    index=len(items),
+                    level="重点核查" if any(flag.level == "重点核查" for flag in flags) else "核查",
+                    student_id=student_id,
+                    student_name=student["学生姓名"],
+                    class_name=student["班级"],
+                    score_column=score_column,
+                    score=student["scores"].get(score_column, ""),
+                    reasons=tuple(flag.reason for flag in flags),
+                )
+            )
+    return items
+
+
+def derive_output_path(base_path: Path, suffix: str) -> Path:
+    return base_path.with_name(f"{base_path.stem}{suffix}{base_path.suffix or '.xlsx'}")
+
+
+def clone_students_with_decisions(
+    students: list[dict[str, Any]],
+    decisions: dict[str, ReviewDecision],
+) -> list[dict[str, Any]]:
+    cloned: list[dict[str, Any]] = []
+    for student in students:
+        copied = {**student, "scores": dict(student["scores"])}
+        for decision in decisions.values():
+            if decision.result != REVIEW_RESULT_MODIFIED:
+                continue
+            for score_column in copied["scores"]:
+                if decision.item_key == make_review_item_key(copied["学号/工号"], score_column):
+                    copied["scores"][score_column] = decision.corrected_score
+        cloned.append(copied)
+    return cloned
+
+
+def write_review_report(
+    output_path: Path,
+    merge_data: MergeData,
+    decisions: dict[str, ReviewDecision],
+    include_modified: bool,
+) -> None:
+    items = build_review_session_items(merge_data)
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "核查报告"
+
+    headers = [
+        "学号/工号",
+        "学生姓名",
+        "班级",
+        *merge_data.score_columns,
+        "核查成绩列",
+        "原成绩",
+        "核查原因",
+        "核查结果",
+        "修正后成绩",
+    ]
+    worksheet.append(headers)
+    students_by_id = {student["学号/工号"]: student for student in merge_data.students}
+    for item in items:
+        decision = decisions.get(item.key)
+        result = decision.result if decision else "未核查"
+        if not include_modified and result == REVIEW_RESULT_MODIFIED:
+            continue
+        student = students_by_id[item.student_id]
+        worksheet.append(
+            [
+                item.student_id,
+                item.student_name,
+                item.class_name,
+                *[student["scores"].get(score_column, "") for score_column in merge_data.score_columns],
+                item.score_column,
+                item.score,
+                "；".join(item.reasons),
+                result,
+                decision.corrected_score if decision and decision.corrected_score is not None else "",
+            ]
+        )
+    style_worksheet(worksheet)
+    workbook.save(output_path)
+
+
+def export_review_outputs(
+    merge_data: MergeData,
+    base_output_path: Path,
+    decisions: dict[str, ReviewDecision],
+    include_filtered_report: bool,
+) -> ReviewExportResult:
+    report_path = derive_output_path(base_output_path, "_核查报告")
+    write_review_report(report_path, merge_data, decisions, include_modified=True)
+
+    has_modified = any(decision.result == REVIEW_RESULT_MODIFIED for decision in decisions.values())
+    corrected_output_path = None
+    if has_modified:
+        corrected_output_path = derive_output_path(base_output_path, "_已修正")
+        corrected_students = clone_students_with_decisions(merge_data.students, decisions)
+        write_output(
+            corrected_output_path,
+            corrected_students,
+            merge_data.score_columns,
+            merge_data.source_previews,
+            merge_data.warnings,
+            True,
+            merge_data.main_grade,
+            merge_data.review_flags,
+            build_cell_reviews(merge_data.review_flags),
+        )
+
+    filtered_report_path = None
+    if include_filtered_report and has_modified:
+        filtered_report_path = derive_output_path(base_output_path, "_核查报告_不含登记错误")
+        write_review_report(filtered_report_path, merge_data, decisions, include_modified=False)
+
+    return ReviewExportResult(
+        report_path=report_path,
+        corrected_output_path=corrected_output_path,
+        filtered_report_path=filtered_report_path,
+    )
 
 
 def style_worksheet(worksheet: Any) -> None:
