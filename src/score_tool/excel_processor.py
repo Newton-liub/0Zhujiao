@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import re
+from statistics import median
 from collections import Counter, OrderedDict, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.comments import Comment
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from .models import ProcessResult, SourceFileConfig, SourcePreview, StudentScoreRow
+from .models import ProcessResult, ReviewFlag, SourceFileConfig, SourcePreview, StudentScoreRow
 
 REQUIRED_HEADERS = {
     "student_id": ("学号/工号", "学号", "工号"),
@@ -32,6 +34,19 @@ class ParsedClass:
     tail: str
 
 
+@dataclass(frozen=True)
+class ScoreScale:
+    name: str
+    full_mark: float
+    low_threshold: float
+
+
+@dataclass(frozen=True)
+class CellReview:
+    level: str
+    reasons: tuple[str, ...]
+
+
 def normalize_text(value: Any) -> str:
     if value is None:
         return ""
@@ -47,6 +62,44 @@ def normalize_student_id(value: Any) -> str:
     if re.fullmatch(r"\d+\.0", text):
         return text[:-2]
     return text
+
+
+def parse_score(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = normalize_text(value)
+    if not text:
+        return None
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    return float(match.group(0)) if match else None
+
+
+def infer_score_scale(values: Iterable[Any]) -> ScoreScale | None:
+    numeric_values = [score for value in values if (score := parse_score(value)) is not None]
+    if not numeric_values:
+        return None
+
+    max_score = max(numeric_values)
+    if max_score <= 10:
+        return ScoreScale(name="10分制", full_mark=10.0, low_threshold=8.0)
+    if max_score <= 100:
+        return ScoreScale(name="百分制", full_mark=100.0, low_threshold=60.0)
+
+    return ScoreScale(name=f"{max_score:g}分制", full_mark=max_score, low_threshold=max_score * 0.6)
+
+
+def normalize_to_percent(score: float | None, scale: ScoreScale | None) -> float | None:
+    if score is None or scale is None or scale.full_mark <= 0:
+        return None
+    return score / scale.full_mark * 100
+
+
+def is_close_score(score: float, target: float) -> bool:
+    return abs(score - target) <= 1e-6
 
 
 def is_blank_row(values: Iterable[Any]) -> bool:
@@ -245,6 +298,178 @@ def preview_sources(configs: list[SourceFileConfig]) -> list[SourcePreview]:
     return previews
 
 
+def analyze_review_flags(
+    students: list[dict[str, Any]],
+    score_columns: list[str],
+) -> tuple[list[ReviewFlag], dict[tuple[str, str], CellReview]]:
+    scales = {
+        score_column: infer_score_scale(student["scores"].get(score_column) for student in students)
+        for score_column in score_columns
+    }
+    score_values = {
+        student["学号/工号"]: {
+            score_column: parse_score(student["scores"].get(score_column))
+            for score_column in score_columns
+        }
+        for student in students
+    }
+    normalized_values = {
+        student_id: {
+            score_column: normalize_to_percent(score, scales[score_column])
+            for score_column, score in scores.items()
+        }
+        for student_id, scores in score_values.items()
+    }
+
+    flags: list[ReviewFlag] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def add_flag(
+        level: str,
+        student: dict[str, Any],
+        score_column: str,
+        reason: str,
+        suggestion: str,
+    ) -> None:
+        student_id = student["学号/工号"]
+        key = (student_id, score_column, reason)
+        if key in seen:
+            return
+        seen.add(key)
+        flags.append(
+            ReviewFlag(
+                level=level,
+                student_id=student_id,
+                student_name=student["学生姓名"],
+                class_name=student["班级"],
+                score_column=score_column,
+                score=student["scores"].get(score_column, ""),
+                reason=reason,
+                suggestion=suggestion,
+            )
+        )
+
+    for score_column in score_columns:
+        scale = scales[score_column]
+        if scale is None:
+            continue
+        for student in students:
+            score = score_values[student["学号/工号"]][score_column]
+            if score is None:
+                continue
+            if is_close_score(score, scale.full_mark):
+                add_flag(
+                    "核查",
+                    student,
+                    score_column,
+                    f"{scale.name}满分 {scale.full_mark:g}，请确认是否确为满分。",
+                    "核对原始成绩、平台导出记录和登分表是否一致。",
+                )
+            if score <= scale.low_threshold:
+                add_flag(
+                    "核查",
+                    student,
+                    score_column,
+                    f"{scale.name}成绩 {score:g} 小于等于核查线 {scale.low_threshold:g}。",
+                    "核对原始成绩，确认是否需要保及格或其他人工处理。",
+                )
+
+    def find_swap_candidate(
+        index: int,
+        student: dict[str, Any],
+        score_column: str,
+        current_percent: float,
+        own_baseline: float,
+    ) -> tuple[str, dict[str, Any]] | None:
+        for offset, label in ((-1, "上一位"), (1, "下一位")):
+            neighbor_index = index + offset
+            if neighbor_index < 0 or neighbor_index >= len(students):
+                continue
+            neighbor = students[neighbor_index]
+            if neighbor["班级"] != student["班级"]:
+                continue
+
+            neighbor_id = neighbor["学号/工号"]
+            neighbor_current = normalized_values[neighbor_id].get(score_column)
+            neighbor_others = [
+                value
+                for column, value in normalized_values[neighbor_id].items()
+                if column != score_column and value is not None
+            ]
+            if neighbor_current is None or len(neighbor_others) < 2:
+                continue
+
+            neighbor_baseline = median(neighbor_others)
+            before = abs(current_percent - own_baseline) + abs(neighbor_current - neighbor_baseline)
+            after = abs(neighbor_current - own_baseline) + abs(current_percent - neighbor_baseline)
+            if after + 15 <= before and abs(neighbor_current - own_baseline) <= 15 and abs(current_percent - neighbor_baseline) <= 15:
+                return label, neighbor
+        return None
+
+    for index, student in enumerate(students):
+        student_id = student["学号/工号"]
+        normalized_scores = normalized_values[student_id]
+        for score_column, current_percent in normalized_scores.items():
+            if current_percent is None:
+                continue
+            other_scores = [
+                value
+                for column, value in normalized_scores.items()
+                if column != score_column and value is not None
+            ]
+            if len(other_scores) < 2:
+                continue
+
+            own_baseline = median(other_scores)
+            if own_baseline - current_percent < 20 or current_percent > min(other_scores) - 10:
+                continue
+
+            swap_candidate = find_swap_candidate(index, student, score_column, current_percent, own_baseline)
+            if swap_candidate is not None:
+                label, neighbor = swap_candidate
+                add_flag(
+                    "重点核查",
+                    student,
+                    score_column,
+                    f"该次成绩明显低于本人其他成绩；与{label}同学 {neighbor['学号/工号']} 对调后更接近双方平时水平。",
+                    "优先核对原表相邻两行、导出顺序、复制粘贴和手工录入记录。",
+                )
+            else:
+                add_flag(
+                    "核查",
+                    student,
+                    score_column,
+                    "该次成绩明显低于本人其他成绩。",
+                    "核对该学生该次原始成绩，确认是否漏录、错列或导入错位。",
+                )
+
+    cell_flags: dict[tuple[str, str], list[ReviewFlag]] = defaultdict(list)
+    for flag in flags:
+        cell_flags[(flag.student_id, flag.score_column)].append(flag)
+
+    cell_reviews = {
+        key: CellReview(
+            level="重点核查" if any(flag.level == "重点核查" for flag in grouped_flags) else "核查",
+            reasons=tuple(flag.reason for flag in grouped_flags),
+        )
+        for key, grouped_flags in cell_flags.items()
+    }
+    return flags, cell_reviews
+
+
+def format_review_summary(flags: list[ReviewFlag]) -> str:
+    if not flags:
+        return ""
+    focus = [flag for flag in flags if flag.level == "重点核查"]
+    normal = [flag for flag in flags if flag.level != "重点核查"]
+    parts: list[str] = []
+    if focus:
+        parts.append("重点核查：" + "；".join(f"{flag.score_column}（{flag.reason}）" for flag in focus))
+    if normal:
+        parts.append("核查：" + "；".join(f"{flag.score_column}（{flag.reason}）" for flag in normal))
+    return "；".join(parts)
+
+
 def merge_sources(configs: list[SourceFileConfig], output_path: Path, include_log_sheet: bool = True) -> ProcessResult:
     if not configs:
         raise ValueError("请至少选择一个 Excel 文件")
@@ -306,12 +531,27 @@ def merge_sources(configs: list[SourceFileConfig], output_path: Path, include_lo
         ),
     )
 
-    write_output(output_path, ordered_students, score_columns, previews, warnings, include_log_sheet, main_grade)
+    review_flags, cell_reviews = analyze_review_flags(ordered_students, score_columns)
+    focus_review_count = sum(1 for flag in review_flags if flag.level == "重点核查")
+
+    write_output(
+        output_path,
+        ordered_students,
+        score_columns,
+        previews,
+        warnings,
+        include_log_sheet,
+        main_grade,
+        review_flags,
+        cell_reviews,
+    )
     return ProcessResult(
         output_path=output_path,
         source_previews=previews,
         row_count=len(ordered_students),
         score_columns=score_columns,
+        review_count=len(review_flags),
+        focus_review_count=focus_review_count,
         warnings=warnings,
     )
 
@@ -324,6 +564,8 @@ def write_output(
     warnings: list[str],
     include_log_sheet: bool,
     main_grade: int | None,
+    review_flags: list[ReviewFlag],
+    cell_reviews: dict[tuple[str, str], CellReview],
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -331,25 +573,72 @@ def write_output(
     worksheet = workbook.active
     worksheet.title = "成绩汇总"
 
-    headers = ["学号/工号", "学生姓名", "班级", *score_columns]
+    review_flags_by_student: dict[str, list[ReviewFlag]] = defaultdict(list)
+    for flag in review_flags:
+        review_flags_by_student[flag.student_id].append(flag)
+
+    headers = ["学号/工号", "学生姓名", "班级", *score_columns, "核查标记"]
     worksheet.append(headers)
-    for student in students:
+    score_column_indexes = {score_column: headers.index(score_column) + 1 for score_column in score_columns}
+    review_column_index = len(headers)
+    focus_fill = PatternFill("solid", fgColor="F4CCCC")
+    review_fill = PatternFill("solid", fgColor="FFF2CC")
+    summary_fill = PatternFill("solid", fgColor="FCE5CD")
+
+    for row_index, student in enumerate(students, start=2):
+        student_id = student["学号/工号"]
+        summary = format_review_summary(review_flags_by_student.get(student_id, []))
         worksheet.append(
             [
-                student["学号/工号"],
+                student_id,
                 student["学生姓名"],
                 student["班级"],
                 *[student["scores"].get(score_column, "") for score_column in score_columns],
+                summary,
             ]
         )
+        if summary:
+            worksheet.cell(row=row_index, column=review_column_index).fill = summary_fill
+
+        for score_column in score_columns:
+            review = cell_reviews.get((student_id, score_column))
+            if review is None:
+                continue
+            cell = worksheet.cell(row=row_index, column=score_column_indexes[score_column])
+            cell.fill = focus_fill if review.level == "重点核查" else review_fill
+            cell.comment = Comment("\n".join(review.reasons), "ScoreTool")
 
     style_worksheet(worksheet)
+
+    if review_flags:
+        review_sheet = workbook.create_sheet("核查明细")
+        review_sheet.append(["级别", "学号/工号", "学生姓名", "班级", "成绩列", "成绩", "原因", "建议"])
+        for flag in sorted(review_flags, key=lambda item: (0 if item.level == "重点核查" else 1, item.class_name, item.student_id, item.score_column)):
+            review_sheet.append([
+                flag.level,
+                flag.student_id,
+                flag.student_name,
+                flag.class_name,
+                flag.score_column,
+                flag.score,
+                flag.reason,
+                flag.suggestion,
+            ])
+        for row in review_sheet.iter_rows(min_row=2):
+            row[0].fill = focus_fill if row[0].value == "重点核查" else review_fill
+        style_worksheet(review_sheet)
 
     if include_log_sheet:
         log_sheet = workbook.create_sheet("处理日志")
         log_sheet.append(["项目", "内容"])
         log_sheet.append(["主年级", main_grade if main_grade is not None else "未识别"])
         log_sheet.append(["输出人数", len(students)])
+        log_sheet.append(["核查标记", f"{len(review_flags)} 条，其中重点核查 {sum(1 for flag in review_flags if flag.level == '重点核查')} 条"])
+        log_sheet.append([])
+        log_sheet.append(["核查规则", "说明"])
+        log_sheet.append(["10分制", "标记 10 分和小于等于 8 分；同时检查某次成绩是否明显低于本人其他成绩。"])
+        log_sheet.append(["百分制", "标记 100 分和小于等于 60 分；同时检查某次成绩是否明显低于本人其他成绩。"])
+        log_sheet.append(["疑似对调", "若异常低分与前后同班同学对调后更接近双方平时水平，则标为重点核查。"])
         log_sheet.append([])
         log_sheet.append(["源文件", "工作表", "表头行", "人数", "成绩列名"])
         for preview in previews:

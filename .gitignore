@@ -36,6 +36,7 @@ credentials*.json
 # IDE and OS files
 .vscode/
 .idea/
+.serena/
 .DS_Store
 Thumbs.db
 

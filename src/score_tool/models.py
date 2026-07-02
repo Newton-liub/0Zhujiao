@@ -30,10 +30,24 @@ class SourcePreview:
     warnings: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class ReviewFlag:
+    level: str
+    student_id: str
+    student_name: str
+    class_name: str
+    score_column: str
+    score: Any
+    reason: str
+    suggestion: str
+
+
 @dataclass
 class ProcessResult:
     output_path: Path
     source_previews: list[SourcePreview]
     row_count: int
     score_columns: list[str]
+    review_count: int = 0
+    focus_review_count: int = 0
     warnings: list[str] = field(default_factory=list)

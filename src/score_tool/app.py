@@ -21,8 +21,8 @@ class ScoreToolApp:
     def __init__(self, root: Tk) -> None:
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("980x680")
-        self.root.minsize(860, 580)
+        self.root.geometry("1080x720")
+        self.root.minsize(940, 620)
 
         self.files: list[Path] = []
         self.score_names: dict[str, str] = {}
@@ -43,7 +43,7 @@ class ScoreToolApp:
 
         title = ttk.Label(top, text="Excel 成绩汇总工具", font=("Microsoft YaHei UI", 16, "bold"))
         title.grid(row=0, column=0, sticky="w")
-        subtitle = ttk.Label(top, text="只保留：学号/工号、学生姓名、班级、各 Excel 的总分列。重修学生自动置顶。")
+        subtitle = ttk.Label(top, text="汇总成绩、重修置顶，并自动标记满分、低分、异常低分和疑似前后同学成绩对调。")
         subtitle.grid(row=1, column=0, sticky="w", pady=(4, 0))
 
         main = ttk.Frame(root, padding=(12, 0, 12, 8))
@@ -88,6 +88,13 @@ class ScoreToolApp:
         ttk.Entry(output_box, textvariable=self.output_path).grid(row=0, column=0, sticky="ew")
         ttk.Button(output_box, text="选择保存位置", command=self.choose_output).grid(row=0, column=1, padx=(6, 0))
         ttk.Checkbutton(output_box, text="导出处理日志工作表", variable=self.include_log_sheet).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        review_note = ttk.Label(
+            output_box,
+            text="核查标记会写入主表最后一列；问题成绩格会高亮，详细原因会写入“核查明细”工作表。",
+            foreground="#6B4E00",
+            wraplength=420,
+        )
+        review_note.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         log_box = ttk.LabelFrame(right, text="预检与日志", padding=10)
         log_box.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
@@ -102,6 +109,10 @@ class ScoreToolApp:
         log_scroll = ttk.Scrollbar(log_box, orient="vertical", command=self.log_text.yview)
         log_scroll.grid(row=0, column=1, sticky="ns")
         self.log_text.configure(yscrollcommand=log_scroll.set)
+        self.log_text.tag_configure("重点核查", background="#F4CCCC")
+        self.log_text.tag_configure("核查", background="#FFF2CC")
+        self.log_text.tag_configure("警告", background="#FCE5CD")
+        self.log_text.tag_configure("错误", background="#F4CCCC")
 
         bottom = ttk.Frame(root, padding=(12, 0, 12, 12))
         bottom.grid(row=2, column=0, sticky="ew")
@@ -213,8 +224,17 @@ class ScoreToolApp:
                 self._add_log("文件", f"{preview.path.name} → {preview.score_name}，{preview.student_count} 人")
             for warning in result.warnings:
                 self._add_log("警告", warning)
-            self.status_text.set(f"已生成：{result.output_path}，共 {result.row_count} 人。")
-            messagebox.showinfo(APP_TITLE, f"汇总完成。\n\n输出文件：{result.output_path}")
+            if result.review_count:
+                self._add_log("核查", f"已生成 {result.review_count} 条核查标记，其中重点核查 {result.focus_review_count} 条。")
+                if result.focus_review_count:
+                    self._add_log("重点核查", "存在疑似异常低分或前后同学成绩对调，请优先查看“核查明细”工作表。")
+            else:
+                self._add_log("核查", "未发现需要标记的满分、低分或异常低分。")
+            self.status_text.set(f"已生成：{result.output_path}，共 {result.row_count} 人，核查 {result.review_count} 条。")
+            messagebox.showinfo(
+                APP_TITLE,
+                f"汇总完成。\n\n输出文件：{result.output_path}\n核查标记：{result.review_count} 条\n重点核查：{result.focus_review_count} 条",
+            )
         except Exception as exc:
             self._show_error("生成失败", exc)
 
@@ -248,7 +268,8 @@ class ScoreToolApp:
             self.log_text.delete(item)
 
     def _add_log(self, item_type: str, message: str) -> None:
-        self.log_text.insert("", "end", values=(item_type, message))
+        tags = (item_type,) if item_type in {"重点核查", "核查", "警告", "错误"} else ()
+        self.log_text.insert("", "end", values=(item_type, message), tags=tags)
 
     def _show_error(self, title: str, exc: Exception) -> None:
         self._add_log("错误", str(exc))
